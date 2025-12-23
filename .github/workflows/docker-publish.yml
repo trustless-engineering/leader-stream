@@ -25,7 +25,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/notwedtm/leader-stream
+          images: ghcr.io/trustless-engineering/leader-stream
           tags: |
             type=sha,format=long
             type=ref,event=tag
