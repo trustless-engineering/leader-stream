@@ -1,4 +1,4 @@
-# Solana Next Leader TPU Map
+# Leader Stream
 
 A Rust/Axum service plus WASM client that serves a live view of upcoming Solana slot leaders and their TPU endpoints, with REST + SSE APIs.
 

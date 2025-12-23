@@ -3,7 +3,7 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Solana Next Leader TPU Map</title>
+        <title>Solana Leader Stream</title>
         <meta name="leader-stream-url" content="{{leader_stream_url}}" />
         <meta
             name="description"
@@ -26,7 +26,7 @@
             content="Live snapshot of upcoming Solana slot leaders and their TPU endpoints."
         />
         <meta name="twitter:image" content="/og.svg" />
-    <link rel="stylesheet" href="/styles.css?{{cache_bust}}" />
+        <link rel="stylesheet" href="/styles.css?{{cache_bust}}" />
     </head>
     <body>
         <div class="backdrop" aria-hidden="true">
@@ -64,8 +64,8 @@
                         Solana Mainnet - Live Leaders
                     </div>
                     <h1>
-                        <span class="title-top">Next Leader</span>
-                        <span class="title-gradient">TPU Map</span>
+                        <span class="title-top">Solana TPU</span>
+                        <span class="title-gradient">Leader Stream</span>
                     </h1>
                     <div id="status" class="status">Ready.</div>
                 </div>
@@ -127,12 +127,12 @@
                         <thead>
                             <tr>
                                 <th>Slots until</th>
-                <th>Slot start</th>
+                                <th>Slot start</th>
                                 <th class="eta-col">Ends (est.)</th>
-                <th class="leader-col">
-                  <span class="th-label">Leader</span>
-                  <span class="th-pause-pill">Paused</span>
-                </th>
+                                <th class="leader-col">
+                                    <span class="th-label">Leader</span>
+                                    <span class="th-pause-pill">Paused</span>
+                                </th>
                                 <th>TPU</th>
                             </tr>
                         </thead>
@@ -148,6 +148,6 @@
             </section>
         </main>
         {{initial_script}}
-    <script src="/app.js?{{cache_bust}}"></script>
-  </body>
+        <script src="/app.js?{{cache_bust}}"></script>
+    </body>
 </html>
