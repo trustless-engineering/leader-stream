@@ -15,3 +15,7 @@ k8s/*.env
 
 # TLS private keys / origin certs (keep out of git)
 certs/
+
+# Maxmind
+GeoIP.conf
+leader-stream/*.mmdb

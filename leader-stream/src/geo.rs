@@ -3,13 +3,14 @@ use std::fs;
 use std::io::{Cursor, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use flate2::read::GzDecoder;
 use maxminddb::geoip2::City;
-use maxminddb::Reader;
+use maxminddb::{MaxMindDBError, Reader};
 use reqwest::Client;
 use tar::Archive;
 use tokio::sync::RwLock;
@@ -29,6 +30,7 @@ pub(crate) struct GeoPoint {
 pub(crate) struct GeoIpService {
     reader: Option<Arc<Reader<Vec<u8>>>>,
     cache: Arc<RwLock<HashMap<String, Option<GeoPoint>>>>,
+    lookup_error_logged: Arc<AtomicBool>,
 }
 
 impl GeoIpService {
@@ -36,6 +38,7 @@ impl GeoIpService {
         Self {
             reader: Some(Arc::new(reader)),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            lookup_error_logged: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -44,6 +47,7 @@ impl GeoIpService {
         Self {
             reader: None,
             cache: Arc::new(RwLock::new(entries)),
+            lookup_error_logged: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -75,10 +79,15 @@ impl GeoIpService {
             }
         };
 
-        let result = reader
-            .lookup::<City>(ip_addr)
-            .ok()
-            .and_then(|city| extract_point(&city));
+        let result = match reader.lookup::<City>(ip_addr) {
+            Ok(city) => extract_point(&city),
+            Err(err) => {
+                if !matches!(err, MaxMindDBError::AddressNotFoundError(_)) {
+                    self.log_lookup_error_once(err);
+                }
+                None
+            }
+        };
         self.cache_write(ip, result.clone()).await;
         result
     }
@@ -87,15 +96,63 @@ impl GeoIpService {
         let mut cache = self.cache.write().await;
         cache.insert(ip.to_string(), value);
     }
+
+    fn log_lookup_error_once(&self, err: MaxMindDBError) {
+        if !self.lookup_error_logged.swap(true, Ordering::SeqCst) {
+            warn!(
+                ?err,
+                "MaxMind database lookup failed; geolocation data will be empty"
+            );
+        }
+    }
 }
 
 pub(crate) async fn load_geoip(config: &Config) -> Result<GeoIpService> {
     let path = resolve_database_path(config)?;
     if !path.exists() {
+        info!(
+            "MaxMind database not found at {}; downloading",
+            path.display()
+        );
         download_database(config, &path).await?;
     }
+    match fs::metadata(&path) {
+        Ok(metadata) => {
+            let size = metadata.len();
+            info!(
+                "MaxMind database ready path={} size_bytes={}",
+                path.display(),
+                size
+            );
+            if size < 1_000_000 {
+                warn!(
+                    "MaxMind database appears unusually small; likely a test DB and lookups may fail"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "failed to read MaxMind database metadata at {}",
+                path.display()
+            );
+        }
+    };
     let reader = Reader::open_readfile(&path)
         .with_context(|| format!("failed to open MaxMind database at {}", path.display()))?;
+    info!(
+        database_type = %reader.metadata.database_type,
+        build_epoch = reader.metadata.build_epoch,
+        ip_version = reader.metadata.ip_version,
+        node_count = reader.metadata.node_count,
+        "MaxMind database metadata loaded"
+    );
+    if !reader.metadata.database_type.to_lowercase().contains("city") {
+        warn!(
+            database_type = %reader.metadata.database_type,
+            "MaxMind database type does not look like a City database; geolocation fields may be empty"
+        );
+    }
     Ok(GeoIpService::from_reader(reader))
 }
 
@@ -207,12 +264,14 @@ fn extract_point(city: &City) -> Option<GeoPoint> {
         .city
         .as_ref()
         .and_then(|record| record.names.as_ref())
-        .and_then(|names| names.get("en").cloned());
+        .and_then(|names| names.get("en"))
+        .map(|value| value.to_string());
     let country_name = city
         .country
         .as_ref()
         .and_then(|record| record.names.as_ref())
-        .and_then(|names| names.get("en").cloned());
+        .and_then(|names| names.get("en"))
+        .map(|value| value.to_string());
     Some(GeoPoint {
         latitude,
         longitude,

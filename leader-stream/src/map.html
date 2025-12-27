@@ -134,6 +134,21 @@
                 font-feature-settings: "tnum" on, "lnum" on;
             }
 
+            .follow-toggle {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                text-transform: none;
+                letter-spacing: 0;
+                font-size: 0.95rem;
+            }
+
+            .follow-toggle input {
+                width: 18px;
+                height: 18px;
+                accent-color: var(--map-accent-strong);
+            }
+
             @media (max-width: 960px) {
                 .globe-wrap {
                     grid-template-columns: 1fr;
@@ -144,7 +159,7 @@
                 }
             }
         </style>
-        <script src="https://unpkg.com/globe.gl@4/dist/globe.gl.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/globe.gl"></script>
     </head>
     <body class="map-page">
         <div class="backdrop" aria-hidden="true">
@@ -175,12 +190,12 @@
                 <aside class="hero-card">
                     <p class="card-copy">
                         Explore the upcoming leader schedule on a live 3D globe. We geolocate TPU
-                        endpoints with the MaxMind database and plot the path of the next validators.
+                        endpoints with the MaxMind database and plot the next validators.
                     </p>
                     <span class="card-label">Live updates</span>
                     <p class="sub">
-                        Updates follow the same leader stream as the main view. Re-renders trigger
-                        after new slots or every 30 seconds.
+                        Updates follow the same leader stream as the main view. Refreshes trigger
+                        when the leader falls outside the current window or you change the limit.
                     </p>
                 </aside>
             </header>
@@ -197,17 +212,15 @@
                 </div>
                 <div class="controls">
                     <div class="field">
-                        <span>Limit</span>
-                        <select id="limit-select">
-                            <option value="100">100</option>
-                            <option value="250" selected>250</option>
-                            <option value="500">500</option>
-                            <option value="1000">1000</option>
-                        </select>
-                    </div>
-                    <div class="field">
                         <span>Last refresh</span>
                         <output id="last-updated" class="filter-summary">Never</output>
+                    </div>
+                    <div class="field">
+                        <span>Follow leader</span>
+                        <label class="follow-toggle" for="follow-current">
+                            <input type="checkbox" id="follow-current" />
+                            Follow current leader
+                        </label>
                     </div>
                 </div>
                 <div class="globe-wrap">
@@ -240,11 +253,11 @@
                 const metaEl = document.getElementById("meta");
                 const globeHost = document.getElementById("globe");
                 const pathList = document.getElementById("path-list");
-                const limitSelect = document.getElementById("limit-select");
                 const lastUpdated = document.getElementById("last-updated");
                 const leadersCountEl = document.getElementById("leaders-count");
                 const geoCountEl = document.getElementById("geo-count");
                 const currentSlotEl = document.getElementById("current-slot");
+                const followToggle = document.getElementById("follow-current");
                 const leaderStreamUrl =
                     document.querySelector('meta[name="leader-stream-url"]')?.content ||
                     "/api/leader-stream";
@@ -252,18 +265,30 @@
                 const accent = (rootStyles.getPropertyValue("--map-accent") || "#a855f7").trim();
                 const accentAlt = (rootStyles.getPropertyValue("--map-accent-alt") || "#22d3ee").trim();
                 const accentStrong = (rootStyles.getPropertyValue("--map-accent-strong") || "#c084fc").trim();
+                const CLUSTER_STEP = 0.6;
+                const CLUSTER_SAMPLE_LIMIT = 3;
+                const BASE_POINT_RADIUS = 0.45;
+                const MAX_POINT_RADIUS = 1.35;
+                const BASE_ALTITUDE = 0.01;
+                const MAX_ALTITUDE = 0.09;
+                const FOLLOW_ALTITUDE = 1.4;
+                const FLASH_COLOR = accentStrong || accent || "#c084fc";
+                const DEFAULT_LIMIT = 5000;
                 let globe;
                 let refreshTimer = null;
-                let lastRefreshMs = 0;
                 let isLoading = false;
-
-                function getLimit() {
-                    const value = parseInt(limitSelect.value || "250", 10);
-                    if (Number.isNaN(value)) {
-                        return 250;
-                    }
-                    return Math.min(Math.max(value, 50), 1000);
-                }
+                let pendingRefresh = false;
+                let currentSlotValue = null;
+                let currentLeaderId = null;
+                let currentClusterKey = null;
+                let lastFocusedClusterKey = null;
+                let leaderData = [];
+                let leaderRuns = [];
+                let pointData = [];
+                let leaderSet = new Set();
+                let leaderClusterMap = new Map();
+                let geolocatedCount = 0;
+                let flashState = false;
 
                 function setStatus(message) {
                     if (statusEl) {
@@ -272,6 +297,9 @@
                 }
 
                 function formatLocation(row) {
+                    if (row.locationLabel) {
+                        return row.locationLabel;
+                    }
                     if (row.city && row.country) {
                         return `${row.city}, ${row.country}`;
                     }
@@ -281,11 +309,176 @@
                     return row.ip || "Location unavailable";
                 }
 
+                function buildUniqueLeaders(rows) {
+                    const map = new Map();
+                    rows.forEach((row) => {
+                        if (!row?.leader) {
+                            return;
+                        }
+                        let entry = map.get(row.leader);
+                        if (!entry) {
+                            entry = {
+                                leader: row.leader,
+                                slot: row.slot,
+                                count: 0,
+                                ip: row.ip,
+                                port: row.port,
+                                latitude: null,
+                                longitude: null,
+                                city: null,
+                                country: null,
+                            };
+                            map.set(row.leader, entry);
+                        }
+                        entry.count += 1;
+                        if (row.slot != null && row.slot < entry.slot) {
+                            entry.slot = row.slot;
+                        }
+                        if (entry.latitude == null && row.latitude != null && row.longitude != null) {
+                            entry.latitude = row.latitude;
+                            entry.longitude = row.longitude;
+                            entry.city = row.city;
+                            entry.country = row.country;
+                            entry.ip = row.ip;
+                            entry.port = row.port;
+                        }
+                    });
+
+                    const leaders = Array.from(map.values()).sort((a, b) => a.slot - b.slot);
+                    const points = leaders.filter(
+                        (row) => row.latitude != null && row.longitude != null,
+                    );
+                    return { leaders, points };
+                }
+
+                function buildClusters(points) {
+                    const clusters = new Map();
+                    const leaderToCluster = new Map();
+                    points.forEach((row) => {
+                        if (row.latitude == null || row.longitude == null) {
+                            return;
+                        }
+                        const key = `${Math.round(row.latitude / CLUSTER_STEP)}:${Math.round(
+                            row.longitude / CLUSTER_STEP,
+                        )}`;
+                        let cluster = clusters.get(key);
+                        if (!cluster) {
+                            const locationLabel =
+                                row.city && row.country
+                                    ? `${row.city}, ${row.country}`
+                                    : row.country || null;
+                            cluster = {
+                                latitude: 0,
+                                longitude: 0,
+                                validators: 0,
+                                count: 0,
+                                slot: row.slot ?? 0,
+                                city: row.city ?? null,
+                                country: row.country ?? null,
+                                locationLabel,
+                                locationKey: `${row.city || ""}|${row.country || ""}`,
+                                clusterKey: key,
+                                leaderSample: [],
+                            };
+                            clusters.set(key, cluster);
+                        }
+                        leaderToCluster.set(row.leader, key);
+                        cluster.validators += 1;
+                        cluster.count += row.count || 0;
+                        cluster.latitude += row.latitude;
+                        cluster.longitude += row.longitude;
+                        if (row.slot != null && row.slot < cluster.slot) {
+                            cluster.slot = row.slot;
+                        }
+                        if (cluster.locationLabel) {
+                            const rowKey = `${row.city || ""}|${row.country || ""}`;
+                            if (rowKey !== cluster.locationKey) {
+                                cluster.locationLabel = "Multiple locations";
+                            }
+                        }
+                        if (cluster.leaderSample.length < CLUSTER_SAMPLE_LIMIT) {
+                            cluster.leaderSample.push(row.leader);
+                        }
+                    });
+
+                    const clusterList = Array.from(clusters.values()).map((cluster) => ({
+                        ...cluster,
+                        latitude: cluster.latitude / cluster.validators,
+                        longitude: cluster.longitude / cluster.validators,
+                    }));
+
+                    let maxCount = 1;
+                    let maxValidators = 1;
+                    clusterList.forEach((cluster) => {
+                        if (cluster.count > maxCount) {
+                            maxCount = cluster.count;
+                        }
+                        if (cluster.validators > maxValidators) {
+                            maxValidators = cluster.validators;
+                        }
+                    });
+                    clusterList.forEach((cluster) => {
+                        const countScale = Math.sqrt(cluster.count / maxCount);
+                        cluster.altitude =
+                            BASE_ALTITUDE + (MAX_ALTITUDE - BASE_ALTITUDE) * countScale;
+                        const validatorScale = Math.sqrt(cluster.validators / maxValidators);
+                        cluster.radius =
+                            BASE_POINT_RADIUS +
+                            (MAX_POINT_RADIUS - BASE_POINT_RADIUS) * validatorScale;
+                    });
+                    return { clusters: clusterList, leaderToCluster };
+                }
+
+                function buildLeaderRuns(rows) {
+                    if (!rows?.length) {
+                        return [];
+                    }
+                    const sorted = rows
+                        .filter((row) => row && row.leader != null && row.slot != null)
+                        .slice()
+                        .sort((a, b) => a.slot - b.slot);
+                    const runs = [];
+                    let current = null;
+                    sorted.forEach((row) => {
+                        const isNext =
+                            current &&
+                            row.leader === current.leader &&
+                            row.slot === current.endSlot + 1;
+                        if (!current || !isNext) {
+                            current = {
+                                leader: row.leader,
+                                startSlot: row.slot,
+                                endSlot: row.slot,
+                                count: 1,
+                                ip: row.ip ?? null,
+                                port: row.port ?? null,
+                                city: row.city ?? null,
+                                country: row.country ?? null,
+                            };
+                            runs.push(current);
+                        } else {
+                            current.endSlot = row.slot;
+                            current.count += 1;
+                        }
+                        if (!current.city && row.city) {
+                            current.city = row.city;
+                        }
+                        if (!current.country && row.country) {
+                            current.country = row.country;
+                        }
+                        if (!current.ip && row.ip) {
+                            current.ip = row.ip;
+                            current.port = row.port ?? current.port;
+                        }
+                    });
+                    return runs;
+                }
+
                 function renderList(path) {
                     pathList.innerHTML = "";
                     if (!path.length) {
                         const item = document.createElement("li");
-                        item.textContent = "No geolocated leaders yet.";
+                        item.textContent = "No leaders yet.";
                         pathList.appendChild(item);
                         return;
                     }
@@ -294,11 +487,20 @@
                         const item = document.createElement("li");
                         const slot = document.createElement("span");
                         slot.className = "slot";
-                        slot.textContent = `Slot ${row.slot}`;
+                        const slotLabel =
+                            row.startSlot === row.endSlot
+                                ? `Slot ${row.startSlot}`
+                                : `Slots ${row.startSlot}–${row.endSlot}`;
+                        slot.textContent = slotLabel;
 
                         const location = document.createElement("span");
                         location.className = "location";
-                        location.textContent = formatLocation(row);
+                        const until =
+                            currentSlotValue != null
+                                ? Math.max(row.startSlot - currentSlotValue, 0)
+                                : null;
+                        const untilLabel = until != null ? ` · in ${until} slots` : "";
+                        location.textContent = `${formatLocation(row)} · ${row.count} slots${untilLabel}`;
 
                         const leader = document.createElement("span");
                         leader.className = "leader";
@@ -311,32 +513,86 @@
                     });
                 }
 
-                function buildArcs(points) {
-                    const arcs = [];
-                    for (let i = 0; i < points.length - 1; i += 1) {
-                        const start = points[i];
-                        const end = points[i + 1];
-                        if (
-                            start.latitude == null ||
-                            start.longitude == null ||
-                            end.latitude == null ||
-                            end.longitude == null
-                        ) {
-                            continue;
-                        }
-                        const sameCoords =
-                            start.latitude === end.latitude && start.longitude === end.longitude;
-                        if (sameCoords) {
-                            continue;
-                        }
-                        arcs.push({
-                            startLat: start.latitude,
-                            startLng: start.longitude,
-                            endLat: end.latitude,
-                            endLng: end.longitude,
-                        });
+                function slotColor(slotsUntil, maxSlotsUntil) {
+                    if (!maxSlotsUntil || maxSlotsUntil <= 0) {
+                        return "rgb(0, 255, 0)";
                     }
-                    return arcs;
+                    const clamped = Math.max(0, Math.min(slotsUntil, maxSlotsUntil));
+                    const t = 1 - clamped / maxSlotsUntil;
+                    const green = Math.round(255 * t);
+                    const blue = Math.round(255 * (1 - t));
+                    return `rgb(0, ${green}, ${blue})`;
+                }
+
+                function pointColor(row) {
+                    if (row.isCurrent) {
+                        return flashState ? FLASH_COLOR : row.color || accentAlt;
+                    }
+                    return row.color || accentAlt;
+                }
+
+                function setGlobeData() {
+                    const globeInstance = ensureGlobe();
+                    if (!globeInstance) {
+                        setStatus("Globe renderer unavailable.");
+                        return;
+                    }
+                    resizeGlobe();
+                    globeInstance.pointsData(pointData);
+                    globeInstance.pointLat("latitude");
+                    globeInstance.pointLng("longitude");
+                    globeInstance.pointLabel((row) => {
+                        const parts = [
+                            `${row.validators} validators`,
+                            `Earliest slot ${row.slot}`,
+                            formatLocation(row),
+                            `Slots: ${row.count}`,
+                        ];
+                        if (row.slotsUntil != null) {
+                            parts.push(`Slots until: ${row.slotsUntil}`);
+                        }
+                        if (row.leaderSample?.length) {
+                            parts.push(row.leaderSample.join("\n"));
+                            const remaining = row.validators - row.leaderSample.length;
+                            if (remaining > 0) {
+                                parts.push(`+ ${remaining} more`);
+                            }
+                        }
+                        return parts.join("\n");
+                    });
+                    globeInstance.arcsData([]);
+                }
+
+                function updateSlotColors() {
+                    if (currentSlotValue == null || !pointData.length) {
+                        return;
+                    }
+                    let maxSlotsUntil = 0;
+                    pointData.forEach((row) => {
+                        row.slotsUntil = Math.max(row.slot - currentSlotValue, 0);
+                        if (row.slotsUntil > maxSlotsUntil) {
+                            maxSlotsUntil = row.slotsUntil;
+                        }
+                    });
+                    pointData.forEach((row) => {
+                        row.color = slotColor(row.slotsUntil, maxSlotsUntil);
+                        row.isCurrent =
+                            currentClusterKey != null && row.clusterKey === currentClusterKey;
+                    });
+                    if (globe) {
+                        globe.pointColor(pointColor);
+                    }
+                }
+
+                function resizeGlobe() {
+                    if (!globe || !globeHost) {
+                        return;
+                    }
+                    const bounds = globeHost.getBoundingClientRect();
+                    if (bounds.width && bounds.height) {
+                        globe.width(bounds.width);
+                        globe.height(bounds.height);
+                    }
                 }
 
                 function ensureGlobe() {
@@ -354,58 +610,96 @@
                         .showAtmosphere(true)
                         .atmosphereColor(accent)
                         .atmosphereAltitude(0.18)
-                        .pointAltitude(0.008)
-                        .pointRadius(0.9)
-                        .pointColor(() => accentAlt)
+                        .pointRadius((row) => row.radius ?? BASE_POINT_RADIUS)
+                        .pointAltitude((row) => row.altitude ?? BASE_ALTITUDE)
+                        .pointColor(pointColor)
                         .arcColor(() => [accentAlt, accentStrong || accent])
                         .arcDashLength(0.35)
                         .arcDashGap(0.2)
                         .arcDashAnimateTime(2800)
                         .arcAltitudeAutoScale(true)
                         .arcStroke(0.6);
+                    resizeGlobe();
+                    window.addEventListener("resize", () => resizeGlobe());
                     return globe;
                 }
 
-                function applyData(data) {
-                    const path = (data?.path || []).filter(
-                        (row) => row.latitude != null && row.longitude != null,
-                    );
-                    leadersCountEl.textContent = (data?.path || []).length.toLocaleString();
-                    geoCountEl.textContent = path.length.toLocaleString();
-                    currentSlotEl.textContent = data?.currentSlot?.toLocaleString() ?? "-";
-                    lastUpdated.textContent = new Date(data?.ts || Date.now()).toLocaleTimeString();
-
-                    renderList(path);
-                    const arcs = buildArcs(path);
-                    const globeInstance = ensureGlobe();
-                    if (!globeInstance) {
-                        setStatus("Globe renderer unavailable.");
+                function focusOnCurrentLeader(animate = true) {
+                    if (!followToggle?.checked || !currentClusterKey || !pointData.length) {
                         return;
                     }
-                    globeInstance.pointsData(path);
-                    globeInstance.pointLat("latitude");
-                    globeInstance.pointLng("longitude");
-                    globeInstance.pointLabel((row) => `${row.leader}\n${formatLocation(row)}`);
-                    globeInstance.arcsData(arcs);
+                    if (currentClusterKey === lastFocusedClusterKey) {
+                        return;
+                    }
+                    const target = pointData.find(
+                        (row) => row.clusterKey === currentClusterKey,
+                    );
+                    if (!target) {
+                        return;
+                    }
+                    const globeInstance = ensureGlobe();
+                    if (!globeInstance) {
+                        return;
+                    }
+                    globeInstance.pointOfView(
+                        { lat: target.latitude, lng: target.longitude, altitude: FOLLOW_ALTITUDE },
+                        animate ? 900 : 0,
+                    );
+                    lastFocusedClusterKey = currentClusterKey;
+                }
 
-                    metaEl.textContent = `${path.length} leaders mapped`;
+                function applyData(data) {
+                    const incoming = Array.isArray(data?.path) ? data.path : [];
+                    if (typeof data?.currentSlot === "number") {
+                        currentSlotValue = data.currentSlot;
+                    }
+                    const unique = buildUniqueLeaders(incoming);
+                    leaderData = unique.leaders;
+                    leaderSet = new Set(unique.leaders.map((row) => row.leader));
+                    geolocatedCount = unique.points.length;
+                    leaderRuns = buildLeaderRuns(incoming);
+                    const clustered = buildClusters(unique.points);
+                    pointData = clustered.clusters;
+                    leaderClusterMap = clustered.leaderToCluster;
+                    if (currentLeaderId) {
+                        currentClusterKey = leaderClusterMap.get(currentLeaderId) || null;
+                    }
+                    if (currentClusterKey) {
+                        lastFocusedClusterKey = null;
+                    }
+
+                    updateSlotColors();
+                    setGlobeData();
+                    renderList(
+                        leaderRuns.filter(
+                            (row) =>
+                                currentSlotValue == null || row.endSlot >= currentSlotValue,
+                        ),
+                    );
+                    focusOnCurrentLeader(false);
+
+                    leadersCountEl.textContent = leaderData.length.toLocaleString();
+                    geoCountEl.textContent = geolocatedCount.toLocaleString();
+                    currentSlotEl.textContent = data?.currentSlot?.toLocaleString() ?? "-";
+                    lastUpdated.textContent = new Date(data?.ts || Date.now()).toLocaleTimeString();
+                    metaEl.textContent = `${geolocatedCount} leaders mapped across ${pointData.length} clusters`;
                     setStatus("Live.");
-                    lastRefreshMs = Date.now();
                 }
 
                 async function loadPath() {
-                    if (isLoading) {
-                        return;
-                    }
-                    isLoading = true;
                     if (refreshTimer) {
                         clearTimeout(refreshTimer);
                         refreshTimer = null;
                     }
-                    const limit = getLimit();
+                    if (isLoading) {
+                        pendingRefresh = true;
+                        return;
+                    }
+                    isLoading = true;
+                    pendingRefresh = false;
                     setStatus("Loading leader path…");
                     try {
-                        const response = await fetch(`/api/leader-path?limit=${limit}`, {
+                        const response = await fetch(`/api/leader-path?limit=${DEFAULT_LIMIT}`, {
                             cache: "no-store",
                         });
                         if (!response.ok) {
@@ -420,10 +714,18 @@
                     } finally {
                         refreshTimer = null;
                         isLoading = false;
+                        if (pendingRefresh) {
+                            pendingRefresh = false;
+                            scheduleRefresh(0);
+                        }
                     }
                 }
 
                 function scheduleRefresh(delay = 800) {
+                    if (isLoading) {
+                        pendingRefresh = true;
+                        return;
+                    }
                     if (refreshTimer) {
                         return;
                     }
@@ -437,36 +739,65 @@
                             if (!event?.data) {
                                 return;
                             }
-                            if (!lastRefreshMs || Date.now() - lastRefreshMs > 2500) {
-                                scheduleRefresh(600);
+                            let payload = null;
+                            try {
+                                payload = JSON.parse(event.data);
+                            } catch (err) {
+                                return;
+                            }
+                            const current = payload?.currentValidator;
+                            if (!current) {
+                                return;
+                            }
+                            currentLeaderId = current;
+                            currentClusterKey = leaderClusterMap.get(current) || null;
+                            flashState = !flashState;
+                            if (typeof payload?.slot === "number") {
+                                currentSlotValue = payload.slot;
+                                if (currentSlotEl) {
+                                    currentSlotEl.textContent = payload.slot.toLocaleString();
+                                }
+                                updateSlotColors();
+                            }
+                            focusOnCurrentLeader(true);
+                            if (leaderRuns.length) {
+                                renderList(
+                                    leaderRuns.filter(
+                                        (row) =>
+                                            currentSlotValue == null ||
+                                            row.endSlot >= currentSlotValue,
+                                    ),
+                                );
+                            }
+                            if (!leaderSet.size) {
+                                return;
+                            }
+                            const nextLeader = payload?.nextValidator ?? null;
+                            const hasCurrent = leaderSet.has(current);
+                            const hasNext = !nextLeader || leaderSet.has(nextLeader);
+                            if (!hasCurrent || !hasNext) {
+                                scheduleRefresh(0);
                             }
                         };
                         source.onerror = () => {
                             setStatus("Live updates unavailable; retrying.");
-                            scheduleRefresh(1200);
                         };
                     } catch (err) {
                         console.warn("SSE unavailable", err);
                     }
                 }
 
-                function syncLimitFromQuery() {
-                    const params = new URLSearchParams(window.location.search);
-                    const param = parseInt(params.get("limit") || "250", 10);
-                    if (!Number.isNaN(param)) {
-                        const clamped = Math.min(Math.max(param, 50), 1000);
-                        limitSelect.value = clamped.toString();
-                    }
+                if (followToggle) {
+                    followToggle.addEventListener("change", () => {
+                        if (followToggle.checked) {
+                            lastFocusedClusterKey = null;
+                            focusOnCurrentLeader(false);
+                        }
+                    });
                 }
 
-                limitSelect.addEventListener("change", () => {
-                    scheduleRefresh(0);
-                });
-
-                syncLimitFromQuery();
                 loadPath();
                 listenForStream();
-                setInterval(() => scheduleRefresh(0), 30000);
             })();
         </script>
     </body>

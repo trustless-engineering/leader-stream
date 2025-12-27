@@ -17,6 +17,9 @@ spec:
       # Required only if the GHCR repo is private.
       imagePullSecrets:
         - name: ghcr-pull-secret
+      volumes:
+        - name: geoip-data
+          emptyDir: {}
       containers:
         - name: leader-stream
           # Replace in CI/CD (e.g. envsubst) with the current git SHA.
@@ -31,9 +34,14 @@ spec:
           env:
             - name: PORT
               value: "3000"
+            - name: MAXMIND_DB_PATH
+              value: "/var/lib/leader-stream/geoip/GeoLite2-City.mmdb"
             # Optional override for Solana RPC
             # - name: SOLANA_RPC_URL
             #   value: "https://your-solana-rpc"
+          volumeMounts:
+            - name: geoip-data
+              mountPath: /var/lib/leader-stream/geoip
           readinessProbe:
             httpGet:
               path: /health
