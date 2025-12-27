@@ -212,13 +212,9 @@
                 </div>
                 <div class="controls">
                     <div class="field">
-                        <span>Last refresh</span>
-                        <output id="last-updated" class="filter-summary">Never</output>
-                    </div>
-                    <div class="field">
                         <span>Follow leader</span>
                         <label class="follow-toggle" for="follow-current">
-                            <input type="checkbox" id="follow-current" />
+                            <input type="checkbox" id="follow-current" checked />
                             Follow current leader
                         </label>
                     </div>
@@ -253,7 +249,6 @@
                 const metaEl = document.getElementById("meta");
                 const globeHost = document.getElementById("globe");
                 const pathList = document.getElementById("path-list");
-                const lastUpdated = document.getElementById("last-updated");
                 const leadersCountEl = document.getElementById("leaders-count");
                 const geoCountEl = document.getElementById("geo-count");
                 const currentSlotEl = document.getElementById("current-slot");
@@ -681,7 +676,6 @@
                     leadersCountEl.textContent = leaderData.length.toLocaleString();
                     geoCountEl.textContent = geolocatedCount.toLocaleString();
                     currentSlotEl.textContent = data?.currentSlot?.toLocaleString() ?? "-";
-                    lastUpdated.textContent = new Date(data?.ts || Date.now()).toLocaleTimeString();
                     metaEl.textContent = `${geolocatedCount} leaders mapped across ${pointData.length} clusters`;
                     setStatus("Live.");
                 }
